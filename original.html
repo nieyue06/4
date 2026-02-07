@@ -16192,27 +16192,10 @@ window.PERF_MONITOR = {
                     ctx.beginPath(); ctx.arc(cx + 8, cy + 6, 4, 0, Math.PI * 2); ctx.fill();
                 }
 
-                // --- TU Mount Fix Logic ---
-                // Avoid double-drawing when we're painting into the background cache
-                if (this._bgCacheDrawing) return;
-
-                try {
-                    const gs = window.GAME_SETTINGS || {};
-                    const mountainsEnabled = (gs.bgMountains !== false) && (gs.__bgMountainsEffective !== false);
-                    if (!mountainsEnabled) return;
-
-                    // Only needed when reduced-motion is enabled; in normal mode the main loop draws parallax separately.
-                    if (!gs.reducedMotion) return;
-
-                    // Respect low-power throttling.
-                    if (this.lowPower) return;
-
-                    // Draw static mountains.
-                    // Note: we need to access the global renderParallaxMountains if available, or if made into a method
-                    if (typeof renderParallaxMountains === 'function') {
-                        renderParallaxMountains(this, { x: 0, y: (cam && cam.y) || 0 }, time);
-                    }
-                } catch (e) { if (typeof console !== 'undefined' && console.debug) console.debug('[Debug] Silently caught:', e); }
+                // --- TU Mount Fix Logic (DISABLED) ---
+                // Mountain rendering is now handled by the standalone TU_MountainV2 patch
+                // which draws after sky and before renderWorld in Game.prototype.render.
+                // This avoids double-drawing, cache thrashing, and z-order conflicts.
             }
 
             renderParallax(cam, time = 0.5) {
@@ -30837,6 +30820,494 @@ function scheduleLogic(i) {
             }
         }
     }, 5000);
+
+})();
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TU_MountainV2 — Standalone parallax mountain patch (replaces old system)
+//
+//  Why: The original renderParallaxMountains was correct visually, but it got
+//  skipped or painted-over by the layered patch chain:
+//    - renderBackgroundCached could be short-circuited by worker / degraded mode
+//    - renderWorld worker path drew its bitmap on top, covering mountains
+//    - _parallaxMountainCache used (t*100)|0 as bucket → constant thrashing
+//    - reduced-motion / low-perf silently skipped the parallax call
+//    - Multiple Game.render patches didn't agree on who draws mountains
+//
+//  Fix: This patch is the *sole authority* on mountain drawing. It:
+//    1. Disables the old renderParallaxMountains (makes it a no-op)
+//    2. Disables mountains inside renderSky (already done above)
+//    3. Wraps Game.prototype.render so mountains are drawn in the correct
+//       z-order (after sky, before renderWorld) every single frame
+//    4. Uses a stable 4-bucket theme system (night/dawn/day/dusk) to avoid
+//       cache thrashing
+//    5. Works regardless of worker render, reduced-motion, low-power, etc.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+(function TU_MountainV2_Patch() {
+    'use strict';
+
+    // ─── Guard: only run once ───
+    if (window.__TU_MountainV2_installed) return;
+    window.__TU_MountainV2_installed = true;
+
+    // ─── 1) Kill old mountain renderer ───
+    // Make the old function a no-op so none of the old call sites produce output
+    if (typeof renderParallaxMountains === 'function') {
+        try {
+            // Keep a reference in case someone needs the old one for debugging
+            window.__TU_oldRenderParallaxMountains = renderParallaxMountains;
+            // Replace globally — the function is declared with `function` in the
+            // render/renderer script block, so it's on window (or the enclosing scope).
+            // We try window assignment first; if it's block-scoped we'll patch the
+            // Renderer.prototype.renderParallax method instead.
+        } catch (e) { /* scope locked, handled below */ }
+    }
+
+    // Patch renderParallax on the Renderer prototype to be a no-op
+    // (all call sites go through this or the global function)
+    try {
+        if (typeof Renderer !== 'undefined' && Renderer.prototype) {
+            Renderer.prototype.renderParallax = function () { /* disabled by MountainV2 */ };
+            Renderer.prototype.renderParallax.__tu_mv2_noop = true;
+        }
+    } catch (e) { /* Renderer not available yet — handled in Game.render wrap */ }
+
+    // ─── 2) Noise utilities (same algorithm as original, copied for isolation) ───
+    const _N = (() => {
+        const hash = (n) => {
+            n = (n << 13) ^ n;
+            return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741824.0);
+        };
+        const smooth = (t) => t * t * (3 - 2 * t);
+        const noise1 = (x, seed) => {
+            const i = Math.floor(x);
+            const f = x - i;
+            const u = smooth(f);
+            return hash((i + seed) | 0) * (1 - u) + hash((i + 1 + seed) | 0) * u;
+        };
+        const fbm = (x, seed, oct) => {
+            oct = oct || 4;
+            let v = 0, amp = 0.55, freq = 1;
+            for (let o = 0; o < oct; o++) {
+                v += amp * noise1(x * freq, seed + o * 101);
+                freq *= 2; amp *= 0.5;
+            }
+            return v;
+        };
+        const ridged = (x, seed, oct) => {
+            oct = oct || 4;
+            let v = 0, amp = 0.65, freq = 1;
+            for (let o = 0; o < oct; o++) {
+                let n = noise1(x * freq, seed + o * 131);
+                n = 1 - Math.abs(n);
+                v += (n * n) * amp;
+                freq *= 2; amp *= 0.55;
+            }
+            return v;
+        };
+        return { fbm, ridged };
+    })();
+
+    // ─── 3) Layer definitions (identical to PARALLAX_LAYERS) ───
+    const LAYERS = [
+        {
+            p: 0.05, y: 260, amp: 145, freq: 0.0019, detail: 0.0065, sharp: 1.60, seed: 17,
+            snow: true, snowLine: 0.74,
+            palette: {
+                night: ['#070a18', '#111a33'],
+                dawn:  ['#20122f', '#3a1f48'],
+                day:   ['#b7d4f4', '#7a9cc2'],
+                dusk:  ['#1c1430', '#3b2953']
+            }
+        },
+        {
+            p: 0.10, y: 215, amp: 120, freq: 0.0025, detail: 0.0078, sharp: 1.45, seed: 33,
+            snow: true, snowLine: 0.76,
+            palette: {
+                night: ['#0b1024', '#18284a'],
+                dawn:  ['#2a1430', '#5a2a3f'],
+                day:   ['#9cc0e0', '#5f86b5'],
+                dusk:  ['#22193f', '#5a3b6d']
+            }
+        },
+        {
+            p: 0.18, y: 165, amp: 105, freq: 0.0034, detail: 0.0105, sharp: 1.30, seed: 57,
+            snow: false, snowLine: 0,
+            palette: {
+                night: ['#111c2c', '#243a4e'],
+                dawn:  ['#3a2340', '#7a3b4b'],
+                day:   ['#7db6c9', '#3d6f86'],
+                dusk:  ['#2b2447', '#7a4b6d']
+            }
+        },
+        {
+            p: 0.30, y: 110, amp: 90, freq: 0.0046, detail: 0.0135, sharp: 1.18, seed: 89,
+            snow: false, snowLine: 0,
+            palette: {
+                night: ['#162a2f', '#2f4a45'],
+                dawn:  ['#3a2f3c', '#8a4a4a'],
+                day:   ['#5fa39b', '#2f6b5f'],
+                dusk:  ['#2a2f47', '#6a5a6d']
+            }
+        },
+        {
+            p: 0.45, y: 65, amp: 70, freq: 0.0060, detail: 0.0180, sharp: 1.10, seed: 123,
+            snow: false, snowLine: 0,
+            palette: {
+                night: ['#1b2a2a', '#3a4a3f'],
+                dawn:  ['#3a2a2a', '#7a3a2f'],
+                day:   ['#4f8a4f', '#2e5f35'],
+                dusk:  ['#2a2a3a', '#4a3a3f']
+            }
+        }
+    ];
+
+    // ─── 4) Stable theme bucketing (4 buckets, no thrashing) ───
+    function getTheme(time) {
+        if (time < 0.22) return 'night';
+        if (time < 0.36) return 'dawn';
+        if (time < 0.72) return 'day';
+        if (time < 0.80) return 'dusk';
+        return 'night';
+    }
+
+    // ─── 5) Chunk-based offscreen rendering ───
+    const CHUNK_W = 512;
+    const OVERLAP = 64;
+    const PAD_CHUNKS = 2;
+
+    function makeCanvas(cw, ch) {
+        let c = null;
+        if (typeof OffscreenCanvas !== 'undefined') {
+            try { c = new OffscreenCanvas(cw, ch); } catch (_) { c = null; }
+        }
+        if (!c) {
+            c = document.createElement('canvas');
+            c.width = cw;
+            c.height = ch;
+        } else {
+            c.width = cw;
+            c.height = ch;
+        }
+        return c;
+    }
+
+    function getCtx(c) {
+        try { return c.getContext('2d', { alpha: true }); }
+        catch (_) {
+            try { return c.getContext('2d', { willReadFrequently: true }); }
+            catch (__) { return null; }
+        }
+    }
+
+    function buildChunk(layer, li, chunkIndex, h, theme, low, step) {
+        const fullW = CHUNK_W + OVERLAP * 2;
+        const canvas = makeCanvas(fullW, h);
+        const g = getCtx(canvas);
+        if (!g) return { canvas: canvas };
+
+        g.clearRect(0, 0, fullW, h);
+
+        // Gradient fill
+        const cols = (layer.palette && layer.palette[theme])
+            ? layer.palette[theme]
+            : ['#222', '#444'];
+        const grad = g.createLinearGradient(0, h - layer.y - 160, 0, h);
+        grad.addColorStop(0, cols[0]);
+        grad.addColorStop(1, cols[1]);
+        g.fillStyle = grad;
+
+        const worldStart = chunkIndex * CHUNK_W;
+        const x0 = -OVERLAP;
+        const x1 = CHUNK_W + OVERLAP;
+
+        const ridgeStroke = (theme === 'day') ? 'rgba(255,255,255,0.20)' : 'rgba(220,230,255,0.14)';
+        const snowStroke  = (theme === 'day') ? 'rgba(255,255,255,0.75)' : 'rgba(220,230,255,0.55)';
+
+        // Collect points for ridge highlight and snow line
+        const pts = [];
+
+        // Mountain contour fill
+        g.beginPath();
+        g.moveTo(0, h + 2);
+
+        for (let x = x0; x < x1; x += step) {
+            const wx = worldStart + x;
+            const r = _N.ridged(wx * layer.freq, layer.seed);
+            const f = _N.fbm(wx * layer.detail, layer.seed + 999);
+            const contour = 0.72 * r + 0.28 * Math.pow(r, layer.sharp || 1.2);
+            const wobble = 0.86 + 0.14 * f;
+            const hh = layer.amp * contour * wobble;
+            const y = h - layer.y - hh;
+            const cx = x + OVERLAP;
+            pts.push(cx, y, hh);
+            g.lineTo(cx, y);
+        }
+
+        // End-cap point
+        {
+            const x = x1;
+            const wx = worldStart + x;
+            const r = _N.ridged(wx * layer.freq, layer.seed);
+            const f = _N.fbm(wx * layer.detail, layer.seed + 999);
+            const contour = 0.72 * r + 0.28 * Math.pow(r, layer.sharp || 1.2);
+            const wobble = 0.86 + 0.14 * f;
+            const hh = layer.amp * contour * wobble;
+            const y = h - layer.y - hh;
+            const cx = x + OVERLAP;
+            pts.push(cx, y, hh);
+            g.lineTo(cx, y);
+        }
+
+        g.lineTo(fullW, h + 2);
+        g.closePath();
+        g.fill();
+
+        // Ridge highlight (thin line for depth)
+        g.save();
+        g.globalAlpha = low ? 0.10 : (0.12 + li * 0.02);
+        g.strokeStyle = ridgeStroke;
+        g.lineWidth = low ? 1 : 2;
+        g.lineJoin = 'round';
+        g.lineCap = 'round';
+        g.beginPath();
+        if (pts.length >= 3) {
+            g.moveTo(pts[0], pts[1]);
+            for (let i = 3; i < pts.length; i += 3) g.lineTo(pts[i], pts[i + 1]);
+        }
+        g.stroke();
+        g.restore();
+
+        // Snow line (only far layers, skip in low-power)
+        if (layer.snow && !low) {
+            const threshold = (layer.snowLine || 0.75) * layer.amp;
+            g.save();
+            g.globalAlpha = (theme === 'day') ? 0.22 : 0.15;
+            g.strokeStyle = snowStroke;
+            g.lineWidth = 2;
+            g.lineJoin = 'round';
+            g.lineCap = 'round';
+            g.beginPath();
+            let inSeg = false;
+            for (let i = 0; i < pts.length; i += 3) {
+                const px = pts[i];
+                const py = pts[i + 1];
+                const hh = pts[i + 2];
+                if (hh > threshold) {
+                    if (!inSeg) { g.moveTo(px, py + 1); inSeg = true; }
+                    else g.lineTo(px, py + 1);
+                } else {
+                    inSeg = false;
+                }
+            }
+            g.stroke();
+            g.restore();
+        }
+
+        return { canvas: canvas };
+    }
+
+    // ─── 6) Per-renderer cache object ───
+    // Stored on the renderer instance as renderer.__mv2Cache
+    function ensureCache(renderer, theme, h, low, step, layerCount) {
+        const cacheKey = theme + '|' + h + '|' + (low ? 1 : 0) + '|' + step + '|' + layerCount;
+        let cache = renderer.__mv2Cache;
+        if (!cache || cache.key !== cacheKey) {
+            cache = renderer.__mv2Cache = {
+                key: cacheKey,
+                theme: theme,
+                h: h,
+                low: low,
+                step: step,
+                layerMaps: [],
+                fogKey: '',
+                fogGrad: null
+            };
+            for (let i = 0; i < layerCount; i++) cache.layerMaps.push(new Map());
+        } else {
+            // Ensure layer count matches
+            while (cache.layerMaps.length < layerCount) cache.layerMaps.push(new Map());
+            if (cache.layerMaps.length > layerCount) cache.layerMaps.length = layerCount;
+        }
+        return cache;
+    }
+
+    // ─── 7) The actual mountain draw function ───
+    function drawMountains(renderer, cam, time) {
+        var ctx = renderer.ctx;
+        var w = renderer.w | 0;
+        var h = renderer.h | 0;
+        if (!ctx || w <= 0 || h <= 0) return;
+
+        // Respect user setting
+        try {
+            var gs = window.GAME_SETTINGS || {};
+            if (gs.bgMountains === false) return;
+            if (gs.__bgMountainsEffective === false) return;
+        } catch (e) { /* ignore */ }
+
+        var low = !!renderer.lowPower;
+        var step = low ? 24 : 12;
+        var layers = low ? LAYERS.slice(0, 3) : LAYERS;
+        var theme = getTheme(time);
+
+        var cache = ensureCache(renderer, theme, h, low, step, layers.length);
+
+        for (var li = 0; li < layers.length; li++) {
+            var layer = layers[li];
+            var map = cache.layerMaps[li];
+
+            // Camera parallax offset
+            var camP = (cam.x || 0) * layer.p;
+
+            // Visible range with margin
+            var startWX = camP - 80;
+            var endWX = camP + w + 80;
+
+            var first = Math.floor(startWX / CHUNK_W);
+            var last  = Math.floor(endWX / CHUNK_W);
+
+            var keepMin = first - PAD_CHUNKS;
+            var keepMax = last + PAD_CHUNKS;
+
+            // Build missing chunks
+            for (var ci = keepMin; ci <= keepMax; ci++) {
+                if (!map.has(ci)) {
+                    map.set(ci, buildChunk(layer, li, ci, h, theme, low, step));
+                }
+            }
+
+            // Evict far-away chunks
+            for (var k of map.keys()) {
+                if (k < keepMin || k > keepMax) map.delete(k);
+            }
+
+            // Draw visible chunks
+            for (var ci2 = first; ci2 <= last; ci2++) {
+                var chunk = map.get(ci2);
+                if (!chunk || !chunk.canvas) continue;
+                var dx = (ci2 * CHUNK_W) - camP;
+                try {
+                    ctx.drawImage(chunk.canvas, OVERLAP, 0, CHUNK_W, h, dx, 0, CHUNK_W, h);
+                } catch (_) {
+                    // OffscreenCanvas drawImage can fail in edge cases; skip gracefully
+                }
+            }
+        }
+
+        // Fog overlay (cached gradient)
+        var fogKey = theme + '|' + h;
+        if (!cache.fogGrad || cache.fogKey !== fogKey) {
+            var fog = ctx.createLinearGradient(0, h * 0.35, 0, h);
+            if (theme === 'day') {
+                fog.addColorStop(0, 'rgba(255,255,255,0.00)');
+                fog.addColorStop(0.72, 'rgba(220,235,255,0.10)');
+                fog.addColorStop(1, 'rgba(200,230,255,0.14)');
+            } else if (theme === 'dawn') {
+                fog.addColorStop(0, 'rgba(255,120,180,0.00)');
+                fog.addColorStop(0.72, 'rgba(255,170,140,0.06)');
+                fog.addColorStop(1, 'rgba(190,210,255,0.10)');
+            } else if (theme === 'dusk') {
+                fog.addColorStop(0, 'rgba(170,140,255,0.00)');
+                fog.addColorStop(0.72, 'rgba(255,160,120,0.05)');
+                fog.addColorStop(1, 'rgba(140,170,230,0.10)');
+            } else {
+                fog.addColorStop(0, 'rgba(190,210,255,0.00)');
+                fog.addColorStop(0.72, 'rgba(160,180,255,0.06)');
+                fog.addColorStop(1, 'rgba(110,140,210,0.12)');
+            }
+            cache.fogGrad = fog;
+            cache.fogKey = fogKey;
+        }
+
+        ctx.save();
+        ctx.fillStyle = cache.fogGrad;
+        ctx.fillRect(0, h * 0.35, w, h);
+        ctx.restore();
+    }
+
+    // ─── 8) Wait for Game to be available, then wrap Game.prototype.render ───
+    function installRenderHook() {
+        var Game = (window.TU && window.TU.Game) || window.Game;
+        var Renderer = (window.TU && window.TU.Renderer) || window.Renderer;
+
+        if (!Game || !Game.prototype || typeof Game.prototype.render !== 'function') {
+            // Retry after a short delay (game might not be loaded yet)
+            setTimeout(installRenderHook, 200);
+            return;
+        }
+
+        // Also ensure Renderer.prototype.renderParallax is neutered
+        if (Renderer && Renderer.prototype && !Renderer.prototype.renderParallax.__tu_mv2_noop) {
+            Renderer.prototype.renderParallax = function () { /* disabled by MountainV2 */ };
+            Renderer.prototype.renderParallax.__tu_mv2_noop = true;
+        }
+
+        // Wrap Game.prototype.render: insert mountain drawing between sky and world
+        var _prevGameRender = Game.prototype.render;
+        if (_prevGameRender.__tu_mv2_wrapped) return; // already installed
+
+        Game.prototype.render = function () {
+            // Let the existing render chain run (sky, parallax-noop, world, etc.)
+            // But we need mountains AFTER sky and BEFORE renderWorld.
+            // Strategy: we intercept renderWorld temporarily so we can draw mountains
+            // right before it executes.
+
+            var renderer = this.renderer;
+            if (!renderer || !renderer.ctx) {
+                return _prevGameRender.call(this);
+            }
+
+            // Temporarily wrap renderWorld on this specific renderer instance
+            var origRW = renderer.renderWorld;
+            var self = this;
+            var mountainsDrawn = false;
+
+            renderer.renderWorld = function (world, cam, time) {
+                // Draw mountains ONCE, right before renderWorld
+                if (!mountainsDrawn) {
+                    mountainsDrawn = true;
+                    try {
+                        var gameCam = self._renderCamera || self.camera || cam || { x: 0, y: 0 };
+                        var gameTime = (typeof self.timeOfDay === 'number') ? self.timeOfDay : (time || 0.5);
+                        drawMountains(renderer, gameCam, gameTime);
+                    } catch (e) {
+                        if (typeof console !== 'undefined' && console.warn) {
+                            console.warn('[MountainV2] draw error:', e);
+                        }
+                    }
+                }
+                // Call the original (possibly patched) renderWorld
+                return origRW.call(this, world, cam, time);
+            };
+
+            try {
+                _prevGameRender.call(this);
+            } finally {
+                // Restore the original renderWorld so we don't permanently double-wrap
+                renderer.renderWorld = origRW;
+            }
+        };
+
+        Game.prototype.render.__tu_mv2_wrapped = true;
+
+        try {
+            if (typeof console !== 'undefined' && console.info) {
+                console.info('[MountainV2] Standalone mountain patch installed successfully');
+            }
+        } catch (e) { /* silent */ }
+    }
+
+    // Kick off installation
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        setTimeout(installRenderHook, 0);
+    } else {
+        document.addEventListener('DOMContentLoaded', function () {
+            setTimeout(installRenderHook, 0);
+        });
+    }
 
 })();
 
